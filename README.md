@@ -78,6 +78,13 @@ structural checker) to render immediately.
   `reg-ends` are arrays of positions — extract a register with
   `(subseq target-string (aref reg-starts n) (aref reg-ends n))`.
 
+> **Provenance and AI Disclosure**
+>
+> This project was built through close collaboration between an
+  experienced human programmer and Claude Sonnet 5 (Anthropic).
+>
+> It is published openly for community scrutiny and iteration.
+
 ## License
 
 [MIT](LICENSE)

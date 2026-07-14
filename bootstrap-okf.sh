@@ -35,6 +35,30 @@
 #     frontmatter block (the only field the spec assigns meaning to
 #     there). validate.sh now reflects that exception.
 #
+# Revised 2026-07-14, after roughly a week of real use building on a
+# bundle this script generated:
+#   - Dropped the hardcoded "database" and "logic" application modules.
+#     Both baked in domain assumptions (PostgreSQL, Common Lisp) specific
+#     to whatever project this script was first written for, not to OKF
+#     generally -- and in a week of real, active use, "database" was
+#     never touched even once, because that project never had one.
+#     Guessing a project's domain shape upfront turned out to be the
+#     wrong call; real modules (tooling references, day-to-day workflow
+#     notes) emerged organically instead, added by hand once the
+#     project's actual shape became clear.
+#   - Added lessons-learned/ (with notebook.md) as a default module
+#     instead, since a running, dated log of non-obvious gotchas and
+#     verified findings proved genuinely universal across that same week
+#     -- unlike "database", every project accumulates knowledge like
+#     this regardless of domain.
+#   - validate.sh gained a check: a directory containing markdown content
+#     (directly, or in a subdirectory) but missing its own index.md is
+#     now flagged as an error. This was a real, previously-invisible gap
+#     -- a real renderer built against this spec (okf-web-server) treats
+#     a directory without index.md as entirely outside the bundle, never
+#     shown, never recursed into, and validate.sh had no way to catch
+#     that mistake before shipping it.
+#
 # Compatible with Debian stable (POSIX sh).
 
 set -e
@@ -45,8 +69,7 @@ set -e
 mkdir -p okf/specification
 mkdir -p okf/maintenance
 mkdir -p okf/automation
-mkdir -p okf/database
-mkdir -p okf/logic
+mkdir -p okf/lessons-learned
 
 # ---------------------------------------------------------------------
 # okf/index.md  (root index -- NO frontmatter, per spec)
@@ -77,12 +100,23 @@ actually needs.
 * [Standard Concept Template](template-concept.md) - blueprint for
   creating new concept files.
 
-## Application Modules
+## Project-Specific Modules
 
-* [Database Module](database/index.md) - PostgreSQL schemas, tables, and
-  indexing strategies for the underlying application.
-* [Logic Module](logic/index.md) - Common Lisp packages, macros, and core
-  functional logic for the underlying application.
+This bundle intentionally starts with no project-specific modules of its
+own -- guessing a project's domain shape upfront (a database module? a
+core-logic module?) turned out to be the wrong call in practice. Add
+modules here as your own project's real shape becomes clear (a
+schema/data module, a core-logic module, a reference module for external
+tools you depend on, ...), using
+[Standard Concept Template](template-concept.md) as the starting point
+for each new concept file, and give every new module its own `index.md`
+linked from here.
+
+## Development Practices
+
+* [Lessons Learned Module](lessons-learned/index.md) - a running,
+  reverse-chronological notebook of non-obvious gotchas and verified
+  findings from actually building and using this project.
 
 ## History
 
@@ -128,6 +162,19 @@ knowledge base are recorded here in reverse chronological order.
   carries none.
 * validate.sh now also resolves absolute, bundle-root-relative links
   (leading `/`), matching section 5.1 of the spec.
+
+## [2026-07-14] - Dropped presumed application modules; added lessons-learned
+* Removed the hardcoded `database`/`logic` starter modules. A week of
+  real use on the bundle this bootstrapper was revised against showed
+  they baked in domain assumptions (PostgreSQL, Common Lisp) that don't
+  generalize, and one went entirely unused for a project with no
+  database at all.
+* Added `lessons-learned/` (with `notebook.md`) as a starter module
+  instead -- a running gotchas/findings log proved genuinely
+  domain-agnostic in that same week, unlike the modules it replaces.
+* `validate.sh` now flags a directory that contains markdown content but
+  has no `index.md` of its own, since a real renderer built against this
+  spec treats such a directory as entirely outside the bundle.
 EOF
 
 # ---------------------------------------------------------------------
@@ -158,7 +205,7 @@ technical specifications clearly.
 ## Dependencies
 
 * Link to related concepts using relative markdown links, e.g.
-  [Database Module](database/index.md).
+  [Lessons Learned Module](lessons-learned/index.md).
 
 ## Notes
 
@@ -319,11 +366,12 @@ because it is trusted by default.
 When implementing a new feature, refactoring existing logic, or modifying
 a database schema:
 
-1. Modify the source code files (e.g. Common Lisp source, PostgreSQL
-   scripts).
+1. Modify the source code files.
 2. Locate the corresponding OKF concept files via the relevant module
-   sub-index (see [Database Module](../database/index.md) or
-   [Logic Module](../logic/index.md)).
+   sub-index (whichever project-specific module you've created for this
+   part of the system -- see the [root index](../index.md) -- or the
+   [Lessons Learned Module](../lessons-learned/index.md) if it's a
+   general finding rather than a specific concept).
 3. Update the Markdown body and the YAML frontmatter inside the affected
    concept files. Use [template-concept.md](../template-concept.md) if a
    new concept is required.
@@ -429,6 +477,11 @@ checks and can be run locally or wired into CI:
   checked to confirm the target exists, whether the link is relative to
   the linking file's own directory or written as an absolute,
   bundle-root-relative path starting with `/`.
+* **Directory membership:** every directory containing markdown content
+  (directly, or in a subdirectory) must have its own `index.md`. Without
+  one, a bundle-aware renderer has no way to know the directory belongs
+  to the bundle at all, and silently treats it and everything beneath it
+  as outside it -- never shown, never linked, never recursed into.
 
 This bundle follows the spec's UTF-8 requirement for concept files;
 there is no ASCII-only rule to check, intentionally, since this bundle
@@ -465,6 +518,10 @@ cat << 'VALIDATE_EOF' > okf/automation/validate.sh
 #   - index.md files have NO frontmatter, EXCEPT the bundle-root
 #     index.md, which may declare `okf_version` in its frontmatter
 #   - every relative markdown link to a .md file resolves to a real file
+#   - every directory containing markdown content (directly, or in a
+#     subdirectory) has its own index.md -- without one, a bundle-aware
+#     renderer has no way to know the directory is part of the bundle at
+#     all, and silently omits it and everything beneath it
 #
 # Usage: sh validate.sh [path-to-okf-root]
 # Exit status: 0 if clean, 1 if any errors were found.
@@ -516,6 +573,12 @@ find "$ROOT" -name '*.md' -print | while IFS= read -r f; do
   done
 done
 
+find "$ROOT" -type d ! -path '*/.git' ! -path '*/.git/*' | while IFS= read -r d; do
+  if [ ! -f "$d/index.md" ] && find "$d" -name '*.md' ! -path '*/.git/*' -print -quit | grep -q .; then
+    echo "ERROR: $d contains markdown content (directly or in a subdirectory) but has no index.md of its own -- a bundle-aware renderer (e.g. okf-web-server) will treat it as outside the bundle entirely, never shown, never recursed into" >> "$ERRFILE"
+  fi
+done
+
 if [ -s "$ERRFILE" ]; then
   cat "$ERRFILE"
   echo ""
@@ -529,35 +592,53 @@ VALIDATE_EOF
 chmod +x okf/automation/validate.sh
 
 # ---------------------------------------------------------------------
-# okf/database/index.md  (stub sub-index)
+# okf/lessons-learned/index.md
 # ---------------------------------------------------------------------
-cat << 'EOF' > okf/database/index.md
-# Database Module
+cat << 'EOF' > okf/lessons-learned/index.md
+# Lessons Learned Module
 
-Catalogs the PostgreSQL architecture: schemas, tables, and indexing
-strategies. When working on database code, consult this index before
-loading unrelated modules.
+A generic notebook for non-obvious gotchas, workarounds, and verified
+findings from actual use of this project's tools and codebase -- the
+things that are easy to rediscover the hard way if not written down.
+Distinct from the root [Change Log](../log.md), which tracks structural
+changes to this OKF bundle itself, not knowledge about the project.
 
-## Tables and Schemas
+## Concepts
 
-* (populate using [template-concept.md](../template-concept.md) as new
-  tables and schemas are added)
+* [Lessons Learned Notebook](notebook.md) - a running, reverse-chronological
+  log of dated entries.
 EOF
 
 # ---------------------------------------------------------------------
-# okf/logic/index.md  (stub sub-index)
+# okf/lessons-learned/notebook.md
 # ---------------------------------------------------------------------
-cat << 'EOF' > okf/logic/index.md
-# Logic Module
+cat << 'EOF' > okf/lessons-learned/notebook.md
+---
+type: Lessons_Log
+title: Lessons Learned Notebook
+description: >
+  A running, reverse-chronological log of non-obvious gotchas and verified
+  findings from actual use of this project's tools and codebase.
+tags: [lessons, gotchas, notebook]
+timestamp: 2026-07-04T18:00:00Z
+---
 
-Catalogs the application's functional logic: Common Lisp packages,
-macros, and core components. When working on Lisp code, consult this
-index before loading unrelated modules.
+# Lessons Learned Notebook
 
-## Packages and Components
+Entries are added as they're discovered, newest first. Unlike the root
+[Change Log](../log.md), this tracks knowledge about the project, not
+structural edits to OKF itself. If an entry grows into something that
+deserves its own reference doc, move it to whichever project-specific
+module fits it and leave a short pointer here. If the entry itself is
+substantial primary-source material (e.g. a raw research transcript)
+rather than a short summary, consider a `research/` sub-module here
+instead, with its own `index.md`, so a reader can skip the raw material
+unless they want the full trail behind a summarized finding.
 
-* (populate using [template-concept.md](../template-concept.md) as new
-  packages and macros are added)
+## [Date] - Title of the finding
+
+* Entries go here as they're discovered. Delete this placeholder once
+  the first real one is added.
 EOF
 
 # ---------------------------------------------------------------------
