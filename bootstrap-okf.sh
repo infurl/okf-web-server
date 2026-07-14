@@ -1,9 +1,18 @@
 #!/bin/sh
 # bootstrap_okf.sh
 #
-# Initializes an OKF repository containing meta-knowledge on how to build,
-# extend, and maintain OKF repositories. This is a synthesis of two earlier
-# drafts:
+# Initializes an OKF (Open Knowledge Format) repository containing
+# meta-knowledge on how to build, extend, and maintain OKF repositories.
+#
+# OKF itself is a real, external, versioned spec, not invented here:
+# https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md
+# (v0.1 as of this writing). What this script generates is a distilled,
+# practical subset of that spec -- see okf/specification/core-spec.md's
+# own "Provenance" section in the generated bundle for exactly what's
+# covered and what isn't yet.
+#
+# This is a synthesis of two earlier drafts, both written with explicit
+# reference to the spec above:
 #   - v1 contributed the detailed core-spec content, the deprecation
 #     workflow, and the synchronous code/context update rules.
 #   - v2 contributed the hierarchical progressive-disclosure layout,
@@ -58,6 +67,19 @@
 #     a directory without index.md as entirely outside the bundle, never
 #     shown, never recursed into, and validate.sh had no way to catch
 #     that mistake before shipping it.
+#
+# Revised again 2026-07-14, same day, after realizing this script (and
+# its generated core-spec.md) never actually credited OKF's real source:
+#   - core-spec.md gained a "Provenance" section citing the real spec URL
+#     explicitly, and this header comment now names it too, rather than
+#     only describing "two earlier drafts" without saying what grounded
+#     them.
+#   - Documented the real spec's `resource` field (a canonical URI for a
+#     concept's underlying asset) in core-spec.md's optional-fields list
+#     -- present in the real spec since it was first published, so this
+#     was an oversight in the original drafting, not a recent spec
+#     change. Not yet demonstrated in any of this script's own generated
+#     example content.
 #
 # Compatible with Debian stable (POSIX sh).
 
@@ -175,6 +197,16 @@ knowledge base are recorded here in reverse chronological order.
 * `validate.sh` now flags a directory that contains markdown content but
   has no `index.md` of its own, since a real renderer built against this
   spec treats such a directory as entirely outside the bundle.
+
+## [2026-07-14] - Credited OKF's real source; documented the `resource` field
+* `core-spec.md` gained a "Provenance" section: OKF is a real, external,
+  versioned spec from Google Cloud Platform's `knowledge-catalog`
+  project, not invented for this bundle. Previously undocumented here.
+* Documented the real spec's optional `resource` field (a canonical URI
+  for a concept's underlying asset) in `core-spec.md`'s optional-fields
+  list. It has been in the real spec since publication, so this was an
+  oversight in the original drafting, not something the spec only
+  recently added.
 EOF
 
 # ---------------------------------------------------------------------
@@ -239,7 +271,7 @@ description: >
   Detailed structural guidelines, mandatory metadata fields, and semantic
   linking rules for OKF concepts.
 tags: [spec, yaml, markdown, syntax]
-timestamp: 2026-07-04T18:00:00Z
+timestamp: 2026-07-14T21:00:00Z
 ---
 
 # Open Knowledge Format Core Specification
@@ -248,6 +280,17 @@ The Open Knowledge Format (OKF) is optimized for deterministic context
 injection into Large Language Models (LLMs). It relies on plain text files
 organized logically within a directory tree. No database, runtime, or SDK
 is required to read or write it.
+
+## 0. Provenance
+
+OKF is a real, external, versioned spec, not invented for this bundle:
+https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md
+(v0.1 as of this writing). This document is a distilled, practical
+subset covering the structural rules a bundle and its tooling need day
+to day; it is not a substitute for the real spec, and does not yet cover
+everything in it. Known gap: the real spec's optional `resource` field
+(see section 3) is documented here but not yet demonstrated in this
+bundle's own generated content.
 
 ## 1. File Structure
 
@@ -288,6 +331,11 @@ PascalCase or snake_case string classifying the resource, e.g.
 
 * `title`: a short, human-readable name for the concept.
 * `description`: a one- or two-sentence summary of the file's content.
+* `resource`: a canonical URI identifying the underlying asset this
+  concept describes (e.g. a link to a live dashboard, a database
+  console, an API's own documentation page). Omit entirely for concepts
+  describing an abstract idea or process rather than a concrete,
+  linkable asset.
 * `tags`: an array of strings used for broad categorization.
 * `timestamp`: an ISO 8601 UTC string tracking when the concept was last
   verified.

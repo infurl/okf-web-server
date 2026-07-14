@@ -30,14 +30,24 @@ the real files on disk at request time.
 
 ## What's an OKF bundle?
 
-A directory of markdown files where every concept file (anything other
-than `index.md`) opens with a YAML frontmatter block carrying at least a
+[Open Knowledge Format (OKF)](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+is a real, versioned, open spec from Google Cloud Platform's
+`knowledge-catalog` project — an open, human- and agent-friendly format
+for representing knowledge as a directory of markdown files. This server
+implements a compliant subset: every concept file (anything other than
+`index.md`) opens with a YAML frontmatter block carrying at least a
 `type` field, plus optional `title`/`description`/`tags`/`timestamp`.
 `index.md` files carry no frontmatter (except optionally at the bundle
 root) and are just a heading plus bulleted links to the concepts in that
 directory — the same shape this server's own sidebar renders
 automatically. `bootstrap-okf.sh`, included in this repo, scaffolds a
 minimal compliant bundle from scratch if you don't already have one.
+
+Not yet covered here: the spec's optional `resource` field (a canonical
+URI for the concept's underlying asset) — this server displays whatever
+frontmatter fields a bundle actually has, so a bundle carrying `resource`
+already renders fine, but `bootstrap-okf.sh`'s generated bundle doesn't
+document or demonstrate it yet.
 
 ## Requirements
 
