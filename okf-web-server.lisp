@@ -28,14 +28,30 @@
   "Root directory of the OKF bundle this server renders. Always a proper
    directory pathname -- see SEGMENTS->PATHNAME for why that matters.")
 
-(defparameter *server-port* 8090
-  "8090-8099 is the published port range this container always reserves
-   for always-on services; this one is pinned to 8090. Kept as the real
-   default (not just a runtime override) so reloading this file no
-   longer silently reverts a live instance back to 8082.")
+(defparameter *workspace-root* (uiop:ensure-directory-pathname #P"/workspace/")
+  "The outer boundary a markdown link may resolve to when it escapes
+   *OKF-ROOT* via enough \"..\" components -- see REWRITE-TARGET and
+   external-files.lisp's /file/... route. Anything outside this, even
+   if a link's syntax points at it, is left unrewritten (so effectively
+   inert), and the route handler never serves it even if asked
+   directly by URL.")
+
+(defparameter *server-port* 8080
+  "8080-8089 is the published port range this container always reserves
+   for always-on services; this one is pinned to 8080.")
 
 (defvar *acceptor* nil
   "The running HUNCHENTOOT acceptor, or NIL if the server is stopped.")
+
+(defun bridge-log-directory ()
+  "The sbcl-bridge directory this process was started/resumed under, per
+   SBCL_BRIDGE_DIR (exported into the process environment for the whole
+   life of the process by sbcl-bridge-ctl.sh, not just at startup -- see
+   its own comments), or NIL if this isn't running under the bridge at
+   all (e.g. the standalone testing entry point at the bottom of this
+   file)."
+  (let ((dir (sb-ext:posix-getenv "SBCL_BRIDGE_DIR")))
+    (when dir (uiop:ensure-directory-pathname dir))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Segment helpers
@@ -221,14 +237,18 @@
                      (cl-ppcre:split "," (format-field-value raw-value)))
           :test #'string=))
 
-(defun render-frontmatter-block (fields)
+(defun render-frontmatter-block (fields current-segments)
   "Renders every frontmatter field as a Field/Value table, except
    'description', which -- being typically a full sentence or more --
    gets its own styled callout below the table instead of a cramped
    table cell, and 'tags', whose value renders as one link per tag
-   (see TAG-INDEX-ROUTE) instead of plain text."
+   (see TAG-INDEX-ROUTE) instead of plain text. CURRENT-SEGMENTS (this
+   page's own segments) rides along on each tag link as a \"from\" query
+   parameter, so the tag index it leads to can mark this page in its
+   list -- see TAG-INDEX-ROUTE."
   (let* ((description (field-value fields "description"))
-         (table-fields (remove "description" fields :key #'car :test #'string-equal)))
+         (table-fields (remove "description" fields :key #'car :test #'string-equal))
+         (from (format nil "~{~a~^/~}" current-segments)))
     (spinneret:with-html-string
       (when (or table-fields description)
         (:div :class "meta"
@@ -238,7 +258,7 @@
                 (:tr (:th (humanize-field-name (car kv)))
                      (:td (if (string-equal (car kv) "tags")
                               (dolist (tag (parse-tag-list (cdr kv)))
-                                (:a :class "tag-link" :href (format nil "/tags/~a" tag) tag))
+                                (:a :class "tag-link" :href (format nil "/tags/~a?from=~a" tag from) tag))
                               (format-field-value (cdr kv))))))))
           (when description
             (:p :class "meta-description" description)))))))
@@ -246,17 +266,28 @@
 ;;; ---------------------------------------------------------------------
 ;;; Markdown link rewriting
 ;;;
-;;; Rewrites href="....md" (relative, or absolute bundle-root-relative
-;;; per specification/core-spec.md section 5.1) targets emitted by 3bmd
-;;; into internal routes. External (scheme-prefixed) links are left
-;;; untouched.
+;;; Rewrites relative/bundle-root-absolute href targets emitted by 3bmd
+;;; into internal routes: a ".md" target resolving inside *OKF-ROOT*
+;;; becomes an OKF page route; anything else that resolves to a real
+;;; file within the broader *WORKSPACE-ROOT* (an image, a source file,
+;;; a ".md" file living outside the bundle proper) becomes a /file/...
+;;; route -- see external-files.lisp. External (scheme-prefixed) links,
+;;; pure fragments, and anything that doesn't resolve to a real file
+;;; anywhere are left untouched.
 ;;; ---------------------------------------------------------------------
 
 (defparameter *md-href-scanner*
-  (cl-ppcre:create-scanner "href=\"([^\"#?]+\\.md)((?:[#?][^\"]*)?)\""))
+  ;; No longer requires a ".md" suffix -- REWRITE-TARGET itself now
+  ;; decides what a resolved target becomes based on what it actually
+  ;; is on disk, not on the href's own spelling.
+  (cl-ppcre:create-scanner "href=\"([^\"#?]+)((?:[#?][^\"]*)?)\""))
 
 (defun external-link-p (target)
-  (cl-ppcre:scan "^[a-zA-Z][a-zA-Z0-9+.-]*://" target))
+  ;; Deliberately just "scheme:", not "scheme://" -- mailto:/tel:/data:
+  ;; links have no "//" but must never be treated as relative file
+  ;; targets now that this scanner matches every href, not just ".md"
+  ;; ones.
+  (cl-ppcre:scan "^[a-zA-Z][a-zA-Z0-9+.-]*:" target))
 
 (defun target-segments->route (segments)
   "SEGMENTS is a list of path segments whose last element still carries
@@ -268,16 +299,132 @@
         (segments->route butl :directory t)
         (segments->route (append butl (list last-seg))))))
 
+(defun relative-segments (pathname &optional (root *okf-root*))
+  "PATHNAME's directory, as path-segment strings relative to ROOT
+   (default *OKF-ROOT*) -- NIL if PATHNAME is ROOT itself. Works for
+   both directory and plain-file pathnames, since PATHNAME-DIRECTORY
+   only ever looks at the directory component either way."
+  (nthcdr (length (pathname-directory root)) (pathname-directory pathname)))
+
+(defun relative-path-segments (pathname root)
+  "PATHNAME's full path -- directory AND name/type -- as segment
+   strings relative to ROOT, the last segment carrying its extension
+   verbatim, e.g. (\"common-lisp\" \"glr-parser\" \"README.md\").
+   Unlike TARGET-SEGMENTS->ROUTE's OKF-specific handling, this never
+   strips \".md\" or collapses \"index\" -- those are bundle-identity
+   conventions that don't apply to an arbitrary file outside it."
+  (append (relative-segments pathname root)
+          (list (if (pathname-type pathname)
+                    (format nil "~a.~a" (pathname-name pathname) (pathname-type pathname))
+                    (pathname-name pathname)))))
+
+(defun within-root-p (truename root)
+  "T if TRUENAME's namestring falls under ROOT's own truename -- both
+   resolved first, so a symlink can't be used to lie about location."
+  (let ((root-truename (ignore-errors (truename root))))
+    (and root-truename
+         (let ((root-ns (namestring root-truename)) (path-ns (namestring truename)))
+           (and (>= (length path-ns) (length root-ns))
+                (string= root-ns path-ns :end2 (length root-ns)))))))
+
+(defun resolve-segments-tracking-overflow (base-segments target-segments)
+  "Like RESOLVE-SEGMENTS, but returns (VALUES RESULT OVERFLOW): OVERFLOW
+   counts how many \"..\" components in TARGET-SEGMENTS had nothing left
+   of BASE-SEGMENTS to pop, i.e. how far past BASE-SEGMENTS' own origin
+   the target asks to go."
+  (let ((stack (reverse base-segments)) (overflow 0))
+    (dolist (seg target-segments)
+      (cond
+        ((string= seg "."))
+        ((string= seg "..") (if stack (pop stack) (incf overflow)))
+        ((string= seg ""))
+        (t (push seg stack))))
+    (values (nreverse stack) overflow)))
+
+(defparameter *workspace-absolute-prefix* "/workspace/"
+  "A markdown link target starting with exactly this is treated as a
+   literal absolute filesystem path -- see TARGET-TRUENAME -- letting a
+   hand-authored link name a file by its real full path without
+   counting \"..\" levels. Unambiguous: no real OKF bundle directory is
+   ever literally named \"workspace\".")
+
+(defun target-truename (target current-dir-segments)
+  "Resolves TARGET (a markdown link's raw href -- relative,
+   bundle-root-absolute, or workspace-absolute) against
+   CURRENT-DIR-SEGMENTS to the real file it names on disk, or NIL if
+   nothing real is there. Three cases:
+   - RELATIVE: \"..\"s may walk past *OKF-ROOT* itself into its parent
+     directories (unlike RESOLVE-SEGMENTS/TARGET-SEGMENTS->ROUTE, which
+     deliberately clamp there for pure OKF-internal routing).
+   - Leading \"/\" but not *WORKSPACE-ABSOLUTE-PREFIX*: bundle-root-
+     ABSOLUTE, per core-spec.md section 5.1 -- always clamped to
+     *OKF-ROOT*, never escapes it, no matter how many \"..\"s follow.
+   - Starting with *WORKSPACE-ABSOLUTE-PREFIX*: a literal absolute
+     filesystem path anchored at *WORKSPACE-ROOT* -- also clamped
+     there, for the same reason.
+   Resolves symlinks (TRUENAME), since the boundary check that uses
+   this must see the real path, not a symlink that could point
+   anywhere."
+  (let* ((workspace-abs-p (and (>= (length target) (length *workspace-absolute-prefix*))
+                               (string= target *workspace-absolute-prefix*
+                                        :end1 (length *workspace-absolute-prefix*))))
+         (bundle-abs-p (and (not workspace-abs-p) (plusp (length target)) (char= (char target 0) #\/)))
+         (raw-target (cond (workspace-abs-p (subseq target (length *workspace-absolute-prefix*)))
+                            (bundle-abs-p (subseq target 1))
+                            (t target)))
+         (root (if workspace-abs-p *workspace-root* *okf-root*))
+         (base-segments (if (or workspace-abs-p bundle-abs-p) nil current-dir-segments)))
+    (multiple-value-bind (segments overflow)
+        (resolve-segments-tracking-overflow base-segments (split-segments raw-target))
+      (when segments
+        (let* ((effective-overflow (if (or workspace-abs-p bundle-abs-p) 0 overflow))
+               (base (if (zerop effective-overflow)
+                         root
+                         (merge-pathnames
+                          (make-pathname :directory (list* :relative (make-list effective-overflow :initial-element :up)))
+                          root)))
+               (last-seg (car (last segments)))
+               (candidate (merge-pathnames
+                           (make-pathname :directory (list* :relative (butlast segments))
+                                          :name (pathname-name last-seg) :type (pathname-type last-seg))
+                           base)))
+          (ignore-errors (truename candidate)))))))
+
 (defun rewrite-target (target current-dir-segments)
   "Returns the rewritten route for TARGET, or NIL if TARGET should be
-   left as-is (an external link)."
+   left as-is: an external link, a pure same-page fragment, or
+   something that doesn't resolve to a real file within
+   *WORKSPACE-ROOT* at all."
   (cond
+    ((or (zerop (length target)) (char= (char target 0) #\#)) nil)
     ((external-link-p target) nil)
-    ((and (plusp (length target)) (char= (char target 0) #\/))
-     (target-segments->route (split-segments (subseq target 1))))
     (t
-     (target-segments->route
-      (resolve-segments current-dir-segments (split-segments target))))))
+     (let ((truename (target-truename target current-dir-segments)))
+       (cond
+         ((null truename) nil)
+         ((and (string-equal (pathname-type truename) "md") (within-root-p truename *okf-root*))
+          (target-segments->route (relative-path-segments truename *okf-root*)))
+         ((within-root-p truename *workspace-root*)
+          (segments->route (cons "file" (relative-path-segments truename *workspace-root*))))
+         (t nil))))))
+
+(defparameter *rendered-external-anchor-scanner*
+  (cl-ppcre:create-scanner "<a href=\"(https?://[^\"]*)\">"))
+
+(defun annotate-external-links (html)
+  "Marks every rendered external (http/https) anchor with an
+   external-link CSS class (badged via ::after in PAGE-CSS) -- the
+   sandbox can't verify these are reachable, so they're assumed valid
+   per the user's own instruction, but visually flagged as external/
+   unverified rather than rendered indistinguishably from an internal
+   route."
+  (cl-ppcre:regex-replace-all
+   *rendered-external-anchor-scanner*
+   html
+   (lambda (target-string start end match-start match-end reg-starts reg-ends)
+     (declare (ignore start end match-start match-end))
+     (format nil "<a class=\"external-link\" href=\"~a\" title=\"External link -- not reachable/verifiable from inside this sandbox; assumed valid unless reported otherwise\">"
+             (subseq target-string (aref reg-starts 0) (aref reg-ends 0))))))
 
 (defun rewrite-markdown-links (html current-dir-segments)
   (cl-ppcre:regex-replace-all
@@ -292,10 +439,107 @@
             (route (rewrite-target target current-dir-segments)))
        (format nil "href=\"~a~a\"" (or route target) suffix)))))
 
+;;; ---------------------------------------------------------------------
+;;; Bare URL autolinking
+;;;
+;;; 3bmd already renders CommonMark's <https://...> autolink syntax
+;;; correctly (verified directly against a live image), but a bare
+;;; "https://..." with no angle brackets and no [text](url) markdown
+;;; syntax around it -- exactly what specification/core-spec.md's own
+;;; reference to SPEC.md turned out to be -- renders as inert plain
+;;; text. This wraps such bare URLs in angle brackets before handing the
+;;; text to 3bmd, so 3bmd's own (already-verified) autolink support does
+;;; the actual rendering, rather than hand-building <a> tags here.
+;;;
+;;; Fenced and inline code spans are shielded first (via placeholder
+;;; tokens) so a URL appearing inside a code sample is never rewritten
+;;; -- it should render as the literal text the author wrote, not
+;;; silently turn into a link.
+;;; ---------------------------------------------------------------------
+
+(defparameter *placeholder-delimiter* (string (code-char 2))
+  "An STX byte: never hand-typed in real markdown source, so safe to use
+   as an unambiguous placeholder delimiter with no escaping needed.")
+
+(defparameter *fenced-code-scanner*
+  (cl-ppcre:create-scanner "```.*?```" :single-line-mode t))
+
+(defparameter *inline-code-scanner*
+  (cl-ppcre:create-scanner "`[^`]*`"))
+
+(defparameter *bare-url-scanner*
+  ;; The body excludes "(){}[]<>\"" so a URL embedded in markdown/HTML
+  ;; link syntax, or simply parenthesized in prose ("(see https://x)"),
+  ;; is bounded correctly without needing balanced-paren counting. The
+  ;; lookbehind additionally rejects the three ways a URL can already be
+  ;; a link's target with no separating space: markdown/HTML link
+  ;; syntax ("(", "\"") or an existing autolink ("<").
+  (cl-ppcre:create-scanner "(?<![(<\"])(https?://[^\\s<>\"(){}\\[\\]]+)"))
+
+(defun trim-trailing-sentence-punctuation (url)
+  "Splits off a trailing run of sentence punctuation from URL that's
+   essentially never intentionally part of a URL in prose, returning
+   (VALUES TRIMMED-URL SUFFIX)."
+  (let ((end (length url)))
+    (loop while (and (plusp end) (find (char url (1- end)) ".,;:!?"))
+          do (decf end))
+    (values (subseq url 0 end) (subseq url end))))
+
+(defun placeholder-out (text scanner tag)
+  "Replaces every SCANNER match in TEXT with a delimited TAG+index
+   placeholder, returning (VALUES NEW-TEXT ORIGINALS-VECTOR) so
+   PLACEHOLDER-IN can restore them afterwards."
+  (let ((originals (make-array 0 :adjustable t :fill-pointer 0)))
+    (values
+     (cl-ppcre:regex-replace-all
+      scanner text
+      (lambda (target-string start end match-start match-end reg-starts reg-ends)
+        (declare (ignore start end reg-starts reg-ends))
+        (vector-push-extend (subseq target-string match-start match-end) originals)
+        (format nil "~a~a~d~a" *placeholder-delimiter* tag (1- (fill-pointer originals))
+                *placeholder-delimiter*)))
+     originals)))
+
+(defun placeholder-in (text originals tag)
+  (let ((scanner (cl-ppcre:create-scanner
+                  (format nil "~a~a(\\d+)~a" *placeholder-delimiter* tag *placeholder-delimiter*))))
+    (cl-ppcre:regex-replace-all
+     scanner text
+     (lambda (target-string start end match-start match-end reg-starts reg-ends)
+       (declare (ignore start end match-start match-end))
+       (aref originals (parse-integer target-string :start (aref reg-starts 0) :end (aref reg-ends 0)))))))
+
+(defun linkify-bare-urls (markdown-text)
+  (multiple-value-bind (shielded1 fenced) (placeholder-out markdown-text *fenced-code-scanner* "F")
+    (multiple-value-bind (shielded2 inline) (placeholder-out shielded1 *inline-code-scanner* "I")
+      (let ((linkified
+              (cl-ppcre:regex-replace-all
+               *bare-url-scanner* shielded2
+               (lambda (target-string start end match-start match-end reg-starts reg-ends)
+                 (declare (ignore start end reg-starts reg-ends))
+                 (multiple-value-bind (url suffix)
+                     (trim-trailing-sentence-punctuation (subseq target-string match-start match-end))
+                   (format nil "<~a>~a" url suffix))))))
+        (placeholder-in (placeholder-in linkified inline "I") fenced "F")))))
+
 (defun render-markdown (markdown-text current-dir-segments)
-  (rewrite-markdown-links
-   (with-output-to-string (s) (3bmd:parse-string-and-print-to-stream markdown-text s))
-   current-dir-segments))
+  ;; Plain 3BMD only understands CommonMark's ORIGINAL inline code spans
+  ;; and 4-space-indented blocks -- GitHub-style ``` fenced blocks (used
+  ;; throughout this bundle, e.g. every Quickstart snippet) silently fall
+  ;; through to being parsed as one giant inline code span wrapped in a
+  ;; <p>, not a <pre><code> block, which is why they wrapped like prose
+  ;; instead of preserving formatting -- confirmed directly by parsing a
+  ;; real Quickstart snippet and inspecting the actual HTML produced, not
+  ;; assumed from a stylesheet guess. 3BMD-EXT-CODE-BLOCKS is the
+  ;; extension that adds real ``` support (with CODE-BLOCKS.LISP's own
+  ;; COLORIZE-based syntax highlighting on by default); *CODE-BLOCKS* has
+  ;; to be bound T around the parse call to enable it, matching every one
+  ;; of that library's own usage examples.
+  (let ((3bmd-code-blocks:*code-blocks* t))
+    (annotate-external-links
+     (rewrite-markdown-links
+      (with-output-to-string (s) (3bmd:parse-string-and-print-to-stream (linkify-bare-urls markdown-text) s))
+      current-dir-segments))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Sidebar (persistent hierarchical index)
@@ -461,7 +705,21 @@
      :margin-right "0.3rem" :text-decoration "none")
    '(".tag-link:hover" :background "#dceaff" :text-decoration "none")
    '(".tag-page-list" :list-style-type "none" :padding-left 0)
-   '(".tag-page-list li" :padding "0.2rem 0")))
+   '(".tag-page-list li" :padding "0.2rem 0")
+   '(".tag-page-list li.active" :font-weight "bold")
+   '(".tag-page-list li.active a" :color "#222" :text-decoration "underline")
+   '(".tag-page-list li.active::before"
+     :content "→ " :color "#007bff")
+   '(".audit-list" :list-style-type "none" :padding-left 0)
+   '(".audit-list li" :padding "0.3rem 0" :border-bottom "1px solid #eee")
+   '(".audit-errors li" :color "#a00")
+   '(".audit-warnings li" :color "#a06a00")
+   '(".audit-clean" :color "#0a0" :font-weight "bold")
+   '(".audit-link" :text-align "right" :font-size "0.9em" :margin "0 0 1rem 0")
+   '("a.external-link" :color "#a05a00")
+   '("a.external-link::after" :content " ↗" :font-size "0.8em")
+   '(".external-file-notice" :font-size "0.9em" :font-style "italic" :color "#666"
+     :border-left "3px solid #ccc" :padding "0.25rem 1rem" :margin "0 0 1rem 0")))
 
 ;;; ---------------------------------------------------------------------
 ;;; Page shell
@@ -498,7 +756,17 @@
       ;; inspecting the rendered page source, not assumed safe just
       ;; because earlier CSS happened to need no escapable characters.
       (:style (:raw (page-css)))
-      ;; Same raw-content-model reasoning as the <style> tag above
+      ;; COLORIZE's own syntax-highlighting classes (.paren1/.string/
+      ;; .keyword/...), emitted by RENDER-MARKDOWN's fenced code blocks
+      ;; now that 3BMD-EXT-CODE-BLOCKS is enabled -- same raw-content-
+      ;; model reasoning as PAGE-CSS above, and the same CSS source
+      ;; EXTERNAL-FILES.LISP's own /file/... route already uses.
+      ;; Included on every page rather than only ones with a fenced code
+      ;; block in them: harmless (no matching classes, no effect) when
+      ;; unused, and avoids a second special case for "does this page
+      ;; have code in it."
+      (:style (:raw colorize:*coloring-css*))
+      ;; Same raw-content-model reasoning as the <style> tags above
       ;; applies to <script>.
       (:script (:raw *sidebar-scroll-script*)))
      (:body
@@ -526,7 +794,9 @@
             (parse-frontmatter (uiop:read-file-string (page-pathname page)))
           (render-page (or (field-value fields "title") "OKF Repository") nil
                        (concatenate 'string
-                                    (render-frontmatter-block fields)
+                                    (spinneret:with-html-string
+                                      (:p :class "audit-link" (:a :href "/audit" "Bundle Audit →")))
+                                    (render-frontmatter-block fields nil)
                                     (render-markdown body (page-dir-segments page)))))
         (render-not-found nil))))
 
@@ -535,17 +805,20 @@
   ;; a literal-prefix match ("tags" + a variable) over a bare wildcard
   ;; regardless of definition order, but keeping the more specific route
   ;; first in the file still reads correctly to a human.
-  (render-page (format nil "Tag: ~a" tag) nil
-               (spinneret:with-html-string
-                 (:h1 (format nil "Tag: ~a" tag))
-                 (let ((matches (pages-tagged tag)))
-                   (if matches
-                       (:ul :class "tag-page-list"
-                         (dolist (p matches)
-                           (:li (:a :href (segments->route (tagged-page-segments p))
-                                    (tagged-page-title p)))))
-                       (:p :class "missing"
-                         (format nil "No pages tagged \"~a\"." tag)))))))
+  (let* ((from (hunchentoot:get-parameter "from"))
+         (from-segments (when (and from (plusp (length from))) (split-segments from))))
+    (render-page (format nil "Tag: ~a" tag) nil
+                 (spinneret:with-html-string
+                   (:h1 (format nil "Tag: ~a" tag))
+                   (let ((matches (pages-tagged tag)))
+                     (if matches
+                         (:ul :class "tag-page-list"
+                           (dolist (p matches)
+                             (:li :class (when (equal (tagged-page-segments p) from-segments) "active")
+                               (:a :href (segments->route (tagged-page-segments p))
+                                   (tagged-page-title p)))))
+                         (:p :class "missing"
+                           (format nil "No pages tagged \"~a\"." tag))))))))
 
 (easy-routes:defroute okf-page-route ("/*path" :method :get :decorators (@html)) ()
   (let* ((segments (remove "" path :test #'string=))
@@ -556,7 +829,7 @@
           (render-page (or (field-value fields "title") (car (last segments)) "OKF Repository")
                        (page-segments page)
                        (concatenate 'string
-                                    (render-frontmatter-block fields)
+                                    (render-frontmatter-block fields (page-segments page))
                                     (render-markdown body (page-dir-segments page)))))
         (render-not-found segments))))
 
@@ -566,10 +839,19 @@
 
 (defun start-server ()
   "Starts the Hunchentoot acceptor with easy-routes. Safe to call again
-   after STOP-SERVER; signals an error if already running."
+   after STOP-SERVER; signals an error if already running. When running
+   under sbcl-bridge, Hunchentoot's own access/message logs are pointed
+   at dedicated files in the bridge directory instead of their default
+   destination (*ERROR-OUTPUT*), which would otherwise interleave every
+   request into sbcl-bridge's own sbcl-output.log."
   (when *acceptor*
     (error "Server already running on port ~a" *server-port*))
-  (setf *acceptor* (make-instance 'easy-routes:easy-routes-acceptor :port *server-port*))
+  (let ((bridge-dir (bridge-log-directory)))
+    (setf *acceptor*
+          (apply #'make-instance 'easy-routes:easy-routes-acceptor :port *server-port*
+                 (when bridge-dir
+                   (list :access-log-destination (merge-pathnames "okf-web-server-access.log" bridge-dir)
+                         :message-log-destination (merge-pathnames "okf-web-server-messages.log" bridge-dir))))))
   (hunchentoot:start *acceptor*)
   (format t "~&OKF web server started on port ~a, serving ~a~%" *server-port* *okf-root*)
   *acceptor*)

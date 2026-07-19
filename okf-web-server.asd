@@ -6,5 +6,8 @@ as clickable links to a per-tag page listing, and a persistent
 hierarchical index tracks the real directory tree."
   :author "OKF project"
   :license "MIT"
-  :depends-on ("hunchentoot" "easy-routes" "spinneret" "lass" "3bmd" "cl-ppcre")
-  :components ((:file "okf-web-server")))
+  :depends-on ("hunchentoot" "easy-routes" "spinneret" "lass" "3bmd"
+               "3bmd-ext-code-blocks" "cl-ppcre" "colorize")
+  :components ((:file "okf-web-server")
+               (:file "audit" :depends-on ("okf-web-server"))
+               (:file "external-files" :depends-on ("okf-web-server"))))
